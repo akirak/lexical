@@ -13,6 +13,7 @@ defmodule Lexical.Ast.Analysis.Analyzer do
   @clauses [:->]
 
   defmodule Alias do
+    @enforce_keys [:module, :as, :line]
     defstruct [:module, :as, :line]
 
     @type t :: %Alias{}
@@ -26,38 +27,133 @@ defmodule Lexical.Ast.Analysis.Analyzer do
     end
   end
 
+  defmodule Import do
+    @enforce_keys [:module, :line]
+    defstruct [:module, :only, :except, :line]
+
+    @type t :: %Import{}
+
+    def new(module, line, opts \\ [])
+
+    def new(module_name, line, opts) when is_atom(module_name) do
+      module_name
+      |> Module.split()
+      |> Enum.map(&String.to_atom/1)
+      |> new(line, opts)
+    end
+
+    def new(module, line, opts) when is_list(module) and line > 0 do
+      opts = Keyword.validate!(opts, [:only, :except])
+      struct!(Import, [module: module, line: line] ++ opts)
+    end
+
+    def to_import_spec(%Import{} = import) do
+      opts =
+        Enum.reject([only: import.only, except: import.except], fn {_, val} -> is_nil(val) end)
+
+      {Module.concat(import.module), opts}
+    end
+
+    # From: https://hexdocs.pm/elixir/Kernel.SpecialForms.html#import/2-selector
+    #
+    # Importing the same module again will erase the previous imports,
+    # except when the except option is used, which is always exclusive
+    # on a previously declared import/2. If there is no previous import,
+    # then it applies to all functions and macros in the module. For
+    # example:
+    #
+    #     import List, only: [flatten: 1, keyfind: 4]
+    #     import List, except: [flatten: 1]
+    #
+    # After the two import calls above, only List.keyfind/4 will be imported.
+
+    # import Foo, only: [bar: 1, baz: 2]
+    # import Foo, except: [bar: 1]
+    def combine(
+          %Import{module: module, only: prev_only},
+          %Import{module: module, except: new_except} = new
+        )
+        when is_list(prev_only) do
+      %Import{new | only: prev_only -- new_except, except: nil}
+    end
+
+    # import Foo, only: :functions
+    # import Foo, except: [bar: 1]
+    def combine(
+          %Import{module: module, only: prev_only},
+          %Import{module: module, except: new_except} = new
+        )
+        when is_atom(prev_only) do
+      %Import{new | only: prev_only, except: new_except}
+    end
+
+    def combine(%Import{}, %Import{} = new), do: new
+  end
+
   defmodule Scope do
-    defstruct [:id, :range, module: [], parent_aliases: %{}, aliases: []]
+    @global_imports [Kernel, Kernel.SpecialForms]
+
+    defstruct [
+      :id,
+      :range,
+      module: [],
+      aliases: [],
+      parent_aliases: %{},
+      imports: [],
+      parent_imports: %{}
+    ]
 
     @type t :: %Scope{}
 
-    def new(id, %Range{} = range, parent_aliases \\ %{}, module \\ []) do
-      %Scope{id: id, range: range, module: module, parent_aliases: parent_aliases}
+    def new(id, %Range{} = range, module, %Scope{} = parent) do
+      %Scope{
+        id: id,
+        range: range,
+        module: module,
+        parent_aliases: alias_map(parent),
+        parent_imports: import_map(parent)
+      }
     end
 
     def global(%Range{} = range) do
-      %Scope{id: :global, range: range}
+      global_imports = Enum.map(@global_imports, &Import.new(&1, range.start.line))
+      %Scope{id: :global, range: range, imports: global_imports}
     end
 
-    @spec alias_map(Scope.t(), Position.t() | :end) :: %{module() => Scope.t()}
+    @spec alias_map(Scope.t(), Position.t() | :end) :: %{atom() => Alias.t()}
     def alias_map(%Scope{} = scope, position \\ :end) do
-      end_line =
-        case position do
-          :end -> scope.range.end.line
-          %Position{line: line} -> line
-        end
-
       scope.aliases
-      # sorting by line ensures that aliases on later lines
-      # override aliases on earlier lines
-      |> Enum.sort_by(& &1.line)
-      |> Enum.take_while(&(&1.line <= end_line))
+      |> take_before(end_line(scope, position))
       |> Map.new(&{&1.as, &1})
       |> Enum.into(scope.parent_aliases)
     end
 
-    def empty?(%Scope{aliases: []}), do: true
+    @spec import_map(Scope.t(), Position.t() | :end) :: %{module() => Import.t()}
+    def import_map(%Scope{} = scope, position \\ :end) do
+      scope.imports
+      |> take_before(end_line(scope, position))
+      |> Enum.reduce(%{}, fn %Import{} = new, imports ->
+        Map.update(imports, new.module, new, &Import.combine(&1, new))
+      end)
+      |> Map.merge(scope.parent_imports, fn _key, prev, new ->
+        Import.combine(prev, new)
+      end)
+    end
+
+    def empty?(%Scope{aliases: [], imports: []}), do: true
     def empty?(%Scope{}), do: false
+
+    defp take_before(items, line) do
+      # sorting by line ensures that items can be processed in the
+      # order that they appeared such that later items can override
+      # earlier items
+      items
+      |> Enum.sort_by(& &1.line)
+      |> Enum.take_while(&(&1.line <= line))
+    end
+
+    defp end_line(%Scope{range: range}, :end), do: range.end.line
+    defp end_line(%Scope{}, %Position{line: line}), do: line
   end
 
   defmodule State do
@@ -66,12 +162,12 @@ defmodule Lexical.Ast.Analysis.Analyzer do
     def new(%Document{} = document) do
       state = %State{document: document}
 
-      scope =
+      global_scope =
         document
         |> global_range()
         |> Scope.global()
 
-      push_scope(state, scope)
+      push_scope(state, global_scope)
     end
 
     def current_scope(%State{scopes: [scope | _]}), do: scope
@@ -85,8 +181,9 @@ defmodule Lexical.Ast.Analysis.Analyzer do
     end
 
     def push_scope(%State{} = state, id, %Range{} = range, module) when is_list(module) do
-      parent_aliases = state |> current_scope() |> Scope.alias_map()
-      scope = Scope.new(id, range, parent_aliases, module)
+      parent_scope = current_scope(state)
+      scope = Scope.new(id, range, module, parent_scope)
+
       push_scope(state, scope)
     end
 
@@ -115,20 +212,9 @@ defmodule Lexical.Ast.Analysis.Analyzer do
       %State{state | scopes: rest, visited: Map.put(state.visited, scope.id, scope)}
     end
 
-    def push_alias(%State{} = state, %Alias{} = alias) do
+    def push(%State{} = state, key, item) do
       update_current_scope(state, fn %Scope{} = scope ->
-        [prefix | rest] = alias.module
-
-        alias =
-          case scope.parent_aliases do
-            %{^prefix => %Alias{} = existing_alias} ->
-              %Alias{alias | module: existing_alias.module ++ rest}
-
-            _ ->
-              alias
-          end
-
-        Map.update!(scope, :aliases, &[alias | &1])
+        Map.update!(scope, key, &[item | &1])
       end)
     end
 
@@ -166,11 +252,12 @@ defmodule Lexical.Ast.Analysis.Analyzer do
   """
   def traverse(quoted, %Document{} = document) do
     quoted = preprocess(quoted)
+    initial_state = State.new(document)
 
     {_, state} =
       Macro.traverse(
         quoted,
-        State.new(document),
+        initial_state,
         fn quoted, state ->
           {quoted, analyze_node(quoted, state)}
         end,
@@ -283,7 +370,7 @@ defmodule Lexical.Ast.Analysis.Analyzer do
     |> maybe_push_implicit_alias(segments, meta[:line])
     # new __MODULE__ alias belongs to the new scope
     |> State.push_scope_for(quoted, module)
-    |> State.push_alias(current_module_alias)
+    |> State.push(:aliases, current_module_alias)
   end
 
   # alias Foo.{Bar, Baz, Buzz.Qux}
@@ -292,7 +379,7 @@ defmodule Lexical.Ast.Analysis.Analyzer do
 
     Enum.reduce(aliases_nodes, state, fn {:__aliases__, _, segments}, state ->
       alias = Alias.new(base_segments ++ segments, List.last(segments), meta[:line])
-      State.push_alias(state, alias)
+      State.push(state, :aliases, alias)
     end)
   end
 
@@ -303,7 +390,7 @@ defmodule Lexical.Ast.Analysis.Analyzer do
     case expand_alias(aliases, state) do
       [_ | _] = segments ->
         alias = Alias.new(segments, List.last(segments), meta[:line])
-        State.push_alias(state, alias)
+        State.push(state, :aliases, alias)
 
       [] ->
         state
@@ -315,11 +402,29 @@ defmodule Lexical.Ast.Analysis.Analyzer do
     with {:ok, alias_as} <- fetch_alias_as(options),
          [_ | _] = segments <- expand_alias(aliases, state) do
       alias = Alias.new(segments, alias_as, meta[:line])
-      State.push_alias(state, alias)
+      State.push(state, :aliases, alias)
     else
       _ ->
         analyze_node({:alias, meta, [aliases]}, state)
     end
+  end
+
+  # import Foo
+  defp analyze_node({:import, meta, [aliases]}, state) do
+    segments = expand_alias(aliases, state)
+    import = Import.new(segments, meta[:line])
+    State.push(state, :imports, import)
+  end
+
+  # import Foo, only: [fun: 1]
+  # import Foo, only: :functions
+  # import Foo, only: :functions, except: [fun: 1]
+  # import Foo, except: [fun: 1]
+  defp analyze_node({:import, meta, [aliases, options]}, state) do
+    segments = expand_alias(aliases, state)
+    import_opts = parse_import_opts(options)
+    import = Import.new(segments, meta[:line], import_opts)
+    State.push(state, :imports, import)
   end
 
   # clauses: ->
@@ -338,8 +443,15 @@ defmodule Lexical.Ast.Analysis.Analyzer do
     state
   end
 
-  defp maybe_push_implicit_alias(%State{} = state, [first_segment | _], line)
-       when is_atom(first_segment) do
+  # don't create an implicit alias if the module is defined using complex forms:
+  # defmodule __MODULE__.Foo do
+  # defmodule unquote(...) do
+  defp maybe_push_implicit_alias(%State{} = state, [non_atom | _], _line)
+       when not is_atom(non_atom) do
+    state
+  end
+
+  defp maybe_push_implicit_alias(%State{} = state, [first_segment | _], line) do
     segments =
       case State.current_module(state) do
         # the head element of top-level modules can be aliased, so we
@@ -353,15 +465,7 @@ defmodule Lexical.Ast.Analysis.Analyzer do
       end
 
     implicit_alias = Alias.new(segments, first_segment, line)
-    State.push_alias(state, implicit_alias)
-  end
-
-  # don't create an implicit alias if the module is defined using complex forms:
-  # defmodule __MODULE__.Foo do
-  # defmodule unquote(...) do
-  defp maybe_push_implicit_alias(%State{} = state, [non_atom | _], _line)
-       when not is_atom(non_atom) do
-    state
+    State.push(state, :aliases, implicit_alias)
   end
 
   defp expand_alias({:__MODULE__, _, nil}, state) do
@@ -445,4 +549,29 @@ defmodule Lexical.Ast.Analysis.Analyzer do
       _ -> {:ok, alias_as}
     end
   end
+
+  defp parse_import_opts(options) when is_list(options) do
+    Enum.flat_map(options, fn
+      {{:__block__, _, [key]}, {:__block__, _, [val]}} when is_atom(key) and is_atom(val) ->
+        [{key, val}]
+
+      {{:__block__, _, [key]}, {:__block__, _, [fun_arities]}}
+      when is_atom(key) and is_list(fun_arities) ->
+        fun_arities =
+          Enum.flat_map(fun_arities, fn
+            {{:__block__, _, [fun]}, {:__block__, _, [arity]}} when is_atom(fun) and arity >= 0 ->
+              [{fun, arity}]
+
+            _ ->
+              []
+          end)
+
+        [{key, fun_arities}]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp parse_import_opts(_), do: []
 end
