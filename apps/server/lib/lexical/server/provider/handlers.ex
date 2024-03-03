@@ -2,6 +2,7 @@ defmodule Lexical.Server.Provider.Handlers do
   alias Lexical.Protocol.Requests
   alias Lexical.Server.Provider.Handlers
 
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def for_request(%_{} = request) do
     case request do
       %Requests.FindReferences{} ->
@@ -27,6 +28,12 @@ defmodule Lexical.Server.Provider.Handlers do
 
       %Requests.ExecuteCommand{} ->
         {:ok, Handlers.Commands}
+
+      %Requests.PrepareRename{} ->
+        {:ok, Handlers.PrepareRename}
+
+      %Requests.Rename{} ->
+        {:ok, Handlers.Rename}
 
       %request_module{} ->
         {:error, {:unhandled, request_module}}
