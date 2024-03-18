@@ -8,9 +8,11 @@ defmodule Lexical.RemoteControl.CodeMod.RenameTest do
   alias Lexical.Test.CodeSigil
   alias Lexical.Test.CursorSupport
   alias Lexical.Test.Fixtures
+  alias Lexical.Test.RangeSupport
 
   import CodeSigil
   import CursorSupport
+  import RangeSupport
   import Lexical.Test.EventualAssertions
   import Fixtures
 
@@ -94,15 +96,33 @@ defmodule Lexical.RemoteControl.CodeMod.RenameTest do
     end
 
     test "returns the function name" do
-      {:ok, result, _} =
-        ~q[
+      code = ~q[
         defmodule Foo do
           def |bar do
           end
         end
-      ] |> prepare()
+      ]
 
+      {:ok, result, range} = prepare(code)
       assert result == "bar"
+      assert code |> strip_cursor() |> decorate(range) == "  def «bar» do"
+    end
+
+    test "only returns function range even if that is a qualified function" do
+      code = ~q[
+        defmodule Foo do
+          def bar do
+          end
+        end
+
+        defmodule Bar do
+          Foo.|bar()
+        end
+      ]
+
+      {:ok, result, range} = prepare(code)
+      assert result == "bar"
+      assert code |> strip_cursor() |> decorate(range) == "  Foo.«bar»()"
     end
 
     test "returns the macro name" do
@@ -311,6 +331,20 @@ defmodule Lexical.RemoteControl.CodeMod.RenameTest do
 
       assert result =~ ~S[defmodule Renamed do]
       assert result =~ ~S[%Renamed{}]
+    end
+  end
+
+  describe "rename callable" do
+    test "it should rename the function" do
+      {:ok, result} =
+        ~q[
+        defmodule Foo do
+          def |bar do
+          end
+        end
+      ] |> rename("renamed_func")
+
+      assert result =~ ~S[def renamed_func]
     end
   end
 
