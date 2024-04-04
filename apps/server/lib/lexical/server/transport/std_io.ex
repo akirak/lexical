@@ -15,7 +15,7 @@ defmodule Lexical.Server.Transport.StdIO do
   end
 
   def init({callback, device}) do
-    :io.setopts(binary: true, encoding: :latin1)
+    :io.setopts(binary: true, encoding: :unicode)
     loop([], device, callback)
   end
 
@@ -54,10 +54,43 @@ defmodule Lexical.Server.Transport.StdIO do
   def write(_, []) do
   end
 
+
+  @compile {:inline, read_line: 1}
+  def read_line(device) do
+    :io.request(device, {:get_until, :unicode, '', __MODULE__, :read_to_crlf, []})
+  end
+
+  # OTP 26 translates CRLF to LF before reach `input`, where OTP 25 doesn't.
+  if :erlang.system_info(:otp_release) == ~c"25" do
+    @delim "\r\n"
+  else
+    @delim "\n"
+  end
+
+  def read_to_crlf(_, :eof) do
+    {:done, :eof, []}
+  end
+
+  def read_to_crlf(buffer, input) do
+    Logger.info("buffer: #{inspect(buffer)}")
+    Logger.info("input: #{inspect(input)}")
+
+    case IO.iodata_to_binary([buffer | input]) |> :string.split(@delim, :leading) do
+      ["", rest] ->
+        {:done, "\n", [rest]}
+
+      [line, rest] ->
+        {:done, line, [rest]}
+      rest ->
+        {:more, rest}
+    end
+  end
+
   # private
 
   defp loop(buffer, device, callback) do
-    case IO.binread(device, :line) do
+    Logger.info("loop")
+    case read_line(device) do
       "\n" ->
         headers = parse_headers(buffer)
 
