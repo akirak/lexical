@@ -54,44 +54,11 @@ defmodule Lexical.Server.Transport.StdIO do
   def write(_, []) do
   end
 
-
-  @compile {:inline, read_line: 1}
-  def read_line(device) do
-    :io.request(device, {:get_until, :latin1, '', __MODULE__, :read_to_crlf, []})
-  end
-
-  # OTP 26 translates CRLF to LF before reach `input`, where OTP 25 doesn't.
-  if :erlang.system_info(:otp_release) == ~c"25" do
-    @delim "\r\n"
-  else
-    @delim "\n"
-  end
-
-  def read_to_crlf(_, :eof) do
-    {:done, :eof, []}
-  end
-
-  def read_to_crlf(buffer, input) do
-    Logger.info("buffer: #{inspect(buffer)}")
-    Logger.info("input: #{inspect(input)}")
-
-    case IO.iodata_to_binary([buffer | input]) |> :string.split(@delim, :leading) do
-      ["", rest] ->
-        {:done, "\n", [rest]}
-
-      [line, rest] ->
-        {:done, line, [rest]}
-      rest ->
-        {:more, rest}
-    end
-  end
-
   # private
 
   defp loop(buffer, device, callback) do
-    Logger.info("loop")
-    case read_line(device) do
-      "\n" ->
+    case read_to_crlf(device) do
+      "\r\n" ->
         headers = parse_headers(buffer)
 
         with {:ok, content_length} <- content_length(headers),
@@ -114,6 +81,29 @@ defmodule Lexical.Server.Transport.StdIO do
 
       line ->
         loop([line | buffer], device, callback)
+    end
+  end
+
+  # IO operations in OTP 26 will convert single "\r" characters to "\n". If
+  # loop reads while an incomplete "\r" (of "\r\n") is in the buffer, it'll
+  # cause the whitespace not to be consumed. `read_to_crlf/3` is required to
+  # account for this. The issue seldom occurs, but prevents any further LSP
+  # messages from being parsed, requiring a restart.
+
+  defp read_to_crlf(device, last \\ nil, buffer \\ [])
+
+  defp read_to_crlf(device, "\r", buffer) do
+    case IO.binread(device, 1) do
+      "\n" -> IO.iodata_to_binary([buffer | "\n"])
+      :eof -> :eof
+      char -> read_to_crlf(device, char, [buffer | char])
+    end
+  end
+
+  defp read_to_crlf(device, _last, buffer) do
+    case IO.binread(device, 1) do
+      :eof -> :eof
+      char -> read_to_crlf(device, char, [buffer | char])
     end
   end
 
