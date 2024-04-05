@@ -15,7 +15,7 @@ defmodule Lexical.Server.Transport.StdIO do
   end
 
   def init({callback, device}) do
-    :io.setopts(binary: true, encoding: :unicode)
+    :io.setopts(binary: true, encoding: :latin1)
     loop([], device, callback)
   end
 
@@ -57,7 +57,7 @@ defmodule Lexical.Server.Transport.StdIO do
 
   @compile {:inline, read_line: 1}
   def read_line(device) do
-    :io.request(device, {:get_until, :unicode, '', __MODULE__, :read_to_crlf, []})
+    :io.request(device, {:get_until, :latin1, '', __MODULE__, :read_to_crlf, []})
   end
 
   # OTP 26 translates CRLF to LF before reach `input`, where OTP 25 doesn't.
