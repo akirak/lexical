@@ -44,6 +44,18 @@ defmodule Lexical.RemoteControl.CodeMod.Rename do
     |> Map.new()
   end
 
+  defp uri_with_operation_counts("emacs", document_changes_list) do
+    document_changes_list
+    |> Enum.flat_map(fn %Document.Changes{document: document, rename_file: rename_file} ->
+      if rename_file do
+        [{document.uri, 1}, {rename_file.new_uri, 1}]
+      else
+        [{document.uri, 2}]
+      end
+    end)
+    |> Map.new()
+  end
+
   defp uri_with_operation_counts(_, document_changes_list) do
     document_changes_list
     |> Enum.flat_map(fn %Document.Changes{document: document, rename_file: rename_file} ->
