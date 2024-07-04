@@ -3,7 +3,7 @@ name: Nix derivation checks
 on:
   push:
     branches: ["main"]
-    paths: ["mix.lock"]
+    paths: ["mix.lock", "flake.lock"]
 
 jobs:
   auto-update-nix-hash:
